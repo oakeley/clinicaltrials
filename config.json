@@ -1,0 +1,20 @@
+{
+  "ollama": {
+    "model": "qwen3:14b",
+    "base_url": "http://localhost:11434",
+    "timeout": 300
+  },
+  "clinicaltrials": {
+    "api_base_url": "https://clinicaltrials.gov/api/v2",
+    "max_studies": 10000,
+    "rate_limit_delay": 1.0
+  },
+  "logging": {
+    "level": "INFO",
+    "log_file": "clinical_trials_query.log",
+    "console_output": true
+  },
+  "output": {
+    "json_file": "clinical_trials_results.json"
+  }
+}
