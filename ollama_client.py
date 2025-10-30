@@ -13,7 +13,7 @@ class OllamaClient:
     Client for interacting with local Ollama LLM models.
     """
 
-    def __init__(self, model: str, base_url: str = "http://localhost:11434", timeout: int = 120):
+    def __init__(self, model: str, base_url: str = "http://localhost:11434", timeout: int = 12000):
         """
         Initialize Ollama client.
 
@@ -279,57 +279,103 @@ Include all available ontology matches for each term."""
 
         return ontology_mappings
 
-    def deduplicate_diseases(self, diseases: List[str]) -> List[str]:
+    def deduplicate_diseases(self, diseases: List[str]) -> tuple[List[str], List[Dict[str, Any]]]:
         """
-        Deduplicate and normalize disease names for API querying.
+        Deduplicate and optimize disease names for ClinicalTrials.gov searching.
 
         Args:
             diseases: List of disease names from ODS file
 
         Returns:
-            Deduplicated and normalized list of disease names
+            Tuple of (optimized_search_terms, mapping_list)
+            where mapping_list contains dicts with 'original' and 'optimized' keys
         """
-        self.logger.info(f"Deduplicating {len(diseases)} diseases using Ollama")
+        self.logger.info(f"Deduplicating and optimizing {len(diseases)} diseases using Ollama")
 
         if not diseases:
-            return []
+            return [], []
 
-        diseases_text = "\n".join([f"{i+1}. {d}" for i, d in enumerate(diseases)])
+        # Basic deduplication first: remove exact duplicates and empty strings
+        unique_diseases = []
+        seen = set()
+        for disease in diseases:
+            disease_clean = disease.strip()
+            if disease_clean and disease_clean.upper() not in seen:
+                unique_diseases.append(disease_clean)
+                seen.add(disease_clean.upper())
 
-        system_prompt = """You are a medical terminology expert. Your task is to deduplicate and normalize disease names for querying clinical trials databases. Merge synonyms, fix typos, and standardize terminology to standard disease names used in ClinicalTrials.gov."""
+        self.logger.info(f"Basic deduplication: {len(diseases)} -> {len(unique_diseases)} unique diseases")
 
-        prompt = f"""Here are {len(diseases)} disease names extracted from a spreadsheet. Please deduplicate them by:
-1. Merging synonyms (e.g., "Diabetes Mellitus" and "Diabetes" should become "Diabetes")
-2. Fixing obvious typos or abbreviations
-3. Standardizing to common medical terminology
-4. Removing duplicates
-5. Keeping the most searchable form for ClinicalTrials.gov API
+        diseases_text = "\n".join(unique_diseases)
 
-Disease list:
-{diseases_text}
+        system_prompt = """You are a ClinicalTrials.gov expert tasked with making a markdown-format dictionary. Correct, expand, and optimise the following disease list for use as search terms on ClinicalTrials.gov."""
 
-Provide a JSON response with this structure:
-{{
-  "deduplicated_diseases": [
-    {{
-      "original_terms": ["list of original terms that map to this"],
-      "normalized_term": "the standardized disease name for API search"
-    }}
-  ]
-}}
+        prompt = f"""Rules:
+- Correct spelling errors and ensure US English.
+- Replace abbreviations and shorthand (e.g., "ACS", "NDD") with full clinical terms.
+- Expand vague or umbrella terms to include specific, relevant diseases or comorbidities.
+- Include comorbidities commonly studied in relation to the disease if relevant (e.g., disrupted sleep, anxiety, cognitive impairment).
+- Remove duplicates and synonyms while keeping medically precise, search-friendly terms.
+- Return a table with each of the original values from the "input disease list" together with the new term suitable for use with ClinicalTrials.gov
+- No explanations, no JSON formatting, just a simple tab-separated list of each old term and the corresponding new terms
+- Return quickly.
 
-Make sure the normalized terms are suitable for searching ClinicalTrials.gov."""
+Input disease list:
+{diseases_text}"""
 
         response_text = self.generate(prompt, system_prompt)
-        dedup_data = self._parse_json_response(response_text)
 
-        deduplicated = dedup_data.get('deduplicated_diseases', [])
-        normalized_diseases = [item.get('normalized_term', '') for item in deduplicated if item.get('normalized_term')]
+        # Parse tab-separated output
+        mapping = []
+        search_terms_set = set()
 
-        self.logger.info(f"Deduplicated to {len(normalized_diseases)} unique diseases")
-        self.logger.info(f"Normalized diseases: {normalized_diseases[:20]}")
+        for line in response_text.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('-') or line.startswith('|'):
+                continue
 
-        return normalized_diseases if normalized_diseases else diseases
+            # Split by tab
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                original = parts[0].strip()
+                optimized = parts[1].strip()
+
+                if original and optimized:
+                    mapping.append({
+                        'original': original,
+                        'optimized': optimized
+                    })
+                    search_terms_set.add(optimized)
+
+        # Deduplicate search terms while preserving order
+        search_terms = []
+        seen_terms = set()
+        for item in mapping:
+            term = item['optimized']
+            if term not in seen_terms:
+                search_terms.append(term)
+                seen_terms.add(term)
+
+        self.logger.info(f"Ollama optimization: {len(unique_diseases)} -> {len(search_terms)} optimized search terms")
+        self.logger.info(f"Created {len(mapping)} term mappings")
+
+        if search_terms:
+            self.logger.info(f"Sample optimized terms (first 10):")
+            for term in search_terms[:10]:
+                self.logger.info(f"  - {term}")
+
+        # If parsing failed, fall back to original list
+        if not mapping:
+            self.logger.warning("Failed to parse Ollama tab-separated output, using original terms")
+            mapping = []
+            for original in unique_diseases:
+                mapping.append({
+                    'original': original,
+                    'optimized': original
+                })
+            search_terms = unique_diseases
+
+        return search_terms, mapping
 
     def _create_data_summary(self, structured_data: Dict[str, Any], max_rows_per_sheet: int = 3) -> str:
         """

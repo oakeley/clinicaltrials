@@ -1,8 +1,10 @@
 {
   "ollama": {
-    "model": "qwen3:14b",
+    "model": "qwen3-30b-32k",
     "base_url": "http://localhost:11434",
-    "timeout": 300
+    "timeout": 1000,
+    "use_for_deduplication": true,
+    "deduplication_limit": 1000
   },
   "clinicaltrials": {
     "api_base_url": "https://clinicaltrials.gov/api/v2",

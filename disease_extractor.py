@@ -3,7 +3,7 @@ Module for extracting disease names directly from ODS data.
 """
 
 import logging
-from typing import List, Set, Dict, Any
+from typing import List, Set, Dict, Any, Tuple
 import re
 
 
@@ -18,33 +18,91 @@ class DiseaseExtractor:
         """
         self.logger = logging.getLogger(__name__)
 
-        self.common_diseases = {
-            'breast cancer', 'lung cancer', 'colorectal cancer', 'prostate cancer',
-            'pancreatic cancer', 'liver cancer', 'stomach cancer', 'ovarian cancer',
-            'melanoma', 'leukemia', 'lymphoma', 'myeloma', 'glioblastoma',
-            'non-small cell lung cancer', 'small cell lung cancer', 'nsclc', 'sclc',
-            'acute myeloid leukemia', 'aml', 'chronic lymphocytic leukemia', 'cll',
-            'multiple myeloma', 'hodgkin lymphoma', 'non-hodgkin lymphoma',
-            'renal cell carcinoma', 'bladder cancer', 'cervical cancer',
-            'endometrial cancer', 'esophageal cancer', 'gastric cancer',
-            'hepatocellular carcinoma', 'head and neck cancer', 'thyroid cancer',
-            'sarcoma', 'mesothelioma', 'neuroblastoma', 'glioma',
-            'alzheimer', 'parkinson', 'diabetes', 'hypertension',
-            'rheumatoid arthritis', 'crohn', 'ulcerative colitis',
-            'multiple sclerosis', 'psoriasis', 'asthma', 'copd'
-        }
-
-    def extract_from_column_o(self, structured_data: Dict[str, Any]) -> List[str]:
+    def remove_brackets_and_content(self, text: str) -> str:
         """
-        Extract disease names from column O (index 14) of the first sheet.
+        Remove bracketed content and extra whitespace from disease name.
+        Example: "ACUTE CORONARY SYNDROME (ACS)" -> "ACUTE CORONARY SYNDROME"
 
         Args:
-            structured_data: Structured data from ODS reader
+            text: Disease name with possible bracketed content
 
         Returns:
-            List of unique disease names from column O
+            Cleaned disease name
         """
-        self.logger.info("Extracting diseases from column O of first sheet")
+        cleaned = re.sub(r'\s*\([^)]*\)', '', text)
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        return cleaned.strip()
+
+    def deduplicate_diseases(self, diseases: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
+        """
+        Deduplicate diseases by removing bracketed content, similar to 'sort | uniq'.
+        Keeps track of original names that map to each deduplicated name.
+
+        Args:
+            diseases: List of disease names (may contain duplicates with different brackets)
+
+        Returns:
+            Tuple of (deduplicated list, mapping of cleaned name to original names)
+        """
+        disease_map = {}
+
+        for disease in diseases:
+            cleaned = self.remove_brackets_and_content(disease)
+
+            if cleaned not in disease_map:
+                disease_map[cleaned] = []
+            disease_map[cleaned].append(disease)
+
+        deduplicated = sorted(disease_map.keys())
+
+        self.logger.info(f"Deduplication: {len(diseases)} -> {len(deduplicated)} unique diseases")
+
+        merged_count = sum(1 for originals in disease_map.values() if len(originals) > 1)
+        self.logger.info(f"Merged {merged_count} disease groups with multiple bracket variations")
+
+        for cleaned, originals in list(disease_map.items())[:5]:
+            if len(originals) > 1:
+                self.logger.info(f"  '{cleaned}' merged from: {originals}")
+
+        return deduplicated, disease_map
+
+    def _column_letter_to_index(self, column_letter: str) -> int:
+        """
+        Convert column letter to zero-based index.
+        A -> 0, B -> 1, C -> 2, etc.
+
+        Args:
+            column_letter: Column letter (A, B, C, etc.)
+
+        Returns:
+            Zero-based column index
+        """
+        column_letter = column_letter.upper().strip()
+        if len(column_letter) != 1 or not column_letter.isalpha():
+            raise ValueError(f"Invalid column letter: {column_letter}")
+
+        return ord(column_letter) - ord('A')
+
+    def extract_from_column(self, structured_data: Dict[str, Any], column_letter: str = 'C',
+                           data_start_row: int = 2) -> List[str]:
+        """
+        Extract disease names from specified column of the first sheet.
+
+        Args:
+            structured_data: Structured data from ODS reader (contains 'raw_rows' key)
+            column_letter: Column letter (A, B, C, etc.) to extract from
+            data_start_row: Row number where data starts (1-based, Excel-style)
+                          1 = no headers, all rows are data
+                          2 = row 1 is header, row 2+ is data (default)
+                          3 = row 2 is header, row 3+ is data
+                          etc.
+
+        Returns:
+            List of unique disease names from specified column
+        """
+        column_index = self._column_letter_to_index(column_letter)
+        self.logger.info(f"Extracting diseases from column {column_letter} (index {column_index}) of first sheet")
+        self.logger.info(f"Data starts at row {data_start_row} (1-based)")
 
         sheet_names = list(structured_data.keys())
         if not sheet_names:
@@ -56,28 +114,63 @@ class DiseaseExtractor:
 
         self.logger.info(f"Reading from sheet: {first_sheet_name}")
 
-        headers = first_sheet.get('headers', [])
-        rows = first_sheet.get('rows', [])
-
-        if len(headers) <= 14:
-            self.logger.error(f"Sheet only has {len(headers)} columns, column O (index 14) not found")
+        raw_rows = first_sheet.get('raw_rows', [])
+        if not raw_rows:
+            self.logger.error("No raw_rows data available. Ensure ODSReader includes raw_rows in structured_data.")
             return []
 
-        column_o_header = headers[14]
-        self.logger.info(f"Column O header: '{column_o_header}'")
+        if data_start_row < 1:
+            self.logger.error(f"Invalid data_start_row: {data_start_row}. Must be >= 1.")
+            return []
+
+        if data_start_row > len(raw_rows):
+            self.logger.error(f"data_start_row {data_start_row} exceeds total rows {len(raw_rows)}")
+            return []
+
+        header_row_index = data_start_row - 2 if data_start_row >= 2 else None
+        data_rows_start_index = data_start_row - 1
+
+        if header_row_index is not None and header_row_index >= 0:
+            headers = raw_rows[header_row_index]
+            if len(headers) <= column_index:
+                self.logger.error(f"Sheet only has {len(headers)} columns, column {column_letter} (index {column_index}) not found")
+                return []
+            column_header = headers[column_index] if column_index < len(headers) else ""
+            self.logger.info(f"Column {column_letter} header (from row {header_row_index + 1}): '{column_header}'")
+        else:
+            column_header = None
+            self.logger.info(f"No header row (data_start_row=1), extracting from column {column_letter} only")
 
         diseases = set()
-        for row in rows:
-            value = row.get(column_o_header, '').strip()
+        data_rows = raw_rows[data_rows_start_index:]
+
+        for row_idx, row in enumerate(data_rows, start=data_start_row):
+            if column_index >= len(row):
+                continue
+
+            value = row[column_index].strip() if column_index < len(row) else ""
             if value and len(value) > 1:
                 diseases.add(value)
 
         diseases_list = sorted(list(diseases))
 
-        self.logger.info(f"Found {len(diseases_list)} unique diseases in column O")
+        self.logger.info(f"Found {len(diseases_list)} unique diseases in column {column_letter}")
         self.logger.info(f"Sample diseases: {diseases_list[:10]}")
 
         return diseases_list
+
+    def extract_from_column_o(self, structured_data: Dict[str, Any]) -> List[str]:
+        """
+        Extract disease names from column O (index 14) of the first sheet.
+        Maintained for backward compatibility.
+
+        Args:
+            structured_data: Structured data from ODS reader
+
+        Returns:
+            List of unique disease names from column O
+        """
+        return self.extract_from_column(structured_data, 'O')
 
     def extract_from_structured_data(self, structured_data: Dict[str, Any],
                                      max_diseases: int = 20) -> List[str]:

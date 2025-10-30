@@ -131,7 +131,8 @@ class ODSReader:
 
             structured_data[sheet_name] = {
                 'headers': headers,
-                'rows': structured_rows
+                'rows': structured_rows,
+                'raw_rows': rows
             }
 
         return structured_data

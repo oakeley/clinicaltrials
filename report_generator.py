@@ -18,17 +18,58 @@ class ReportGenerator:
     Generates comprehensive reports with statistics and visualizations.
     """
 
-    def __init__(self, output_dir: str = "."):
+    def __init__(self, output_dir: str = ".", base_filename: str = "clinical_trials"):
         """
         Initialize report generator.
 
         Args:
             output_dir: Directory for output files
+            base_filename: Base filename for the report (sanitized)
         """
         self.output_dir = Path(output_dir)
+        self.base_filename = base_filename
         self.logger = logging.getLogger(__name__)
         self.figures_dir = self.output_dir / "figures"
         self.figures_dir.mkdir(exist_ok=True)
+
+    def _sanitize_text(self, text: str) -> str:
+        """
+        Sanitize text to avoid problematic Unicode characters in reports.
+        Converts full-width characters to normal ASCII equivalents.
+
+        Args:
+            text: Input text
+
+        Returns:
+            Sanitized text safe for report rendering
+        """
+        import unicodedata
+
+        if not isinstance(text, str):
+            return str(text)
+
+        # Normalize to decomposed form and then recompose
+        text = unicodedata.normalize('NFKC', text)
+
+        # Replace common problematic Unicode with ASCII equivalents
+        replacements = {
+            '\uff08': '(',  # Full-width left parenthesis
+            '\uff09': ')',  # Full-width right parenthesis
+            '\u2018': "'",  # Left single quotation mark
+            '\u2019': "'",  # Right single quotation mark
+            '\u201c': '"',  # Left double quotation mark
+            '\u201d': '"',  # Right double quotation mark
+            '\u2013': '-',  # En dash
+            '\u2014': '-',  # Em dash
+        }
+
+        for unicode_char, ascii_char in replacements.items():
+            text = text.replace(unicode_char, ascii_char)
+
+        # Remove any remaining non-ASCII printable characters
+        text = ''.join(c if ord(c) < 128 or c.isspace() else '' for c in text)
+
+        return text
 
     def generate_report(self, results_by_disease: Dict[str, List[Dict[str, Any]]],
                        metadata: Dict[str, Any]) -> str:
@@ -53,9 +94,14 @@ class ReportGenerator:
         report_lines.extend(self._generate_visualizations_section(results_by_disease))
         report_lines.extend(self._generate_conclusions(results_by_disease))
 
+        disease_mapping = metadata.get('disease_mapping', [])
+        optimized_diseases = metadata.get('optimized_diseases', [])
+        if disease_mapping:
+            report_lines.extend(self._generate_disease_mapping_appendix(disease_mapping, optimized_diseases))
+
         report_content = "\n".join(report_lines)
 
-        report_path = self.output_dir / "clinical_trials_report.md"
+        report_path = self.output_dir / f"{self.base_filename}_report.md"
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report_content)
 
@@ -129,10 +175,16 @@ class ReportGenerator:
             f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
             f"**Source Data:** {', '.join(metadata.get('source_sheets', []))}",
-            "",
-            "---",
             ""
         ]
+
+        ollama_model = metadata.get('ollama_model')
+        if ollama_model:
+            lines.append(f"**Disease Terms Optimized Using:** {ollama_model}")
+            lines.append("")
+
+        lines.extend(["---", ""])
+
         return lines
 
     def _generate_executive_summary(self, results_by_disease: Dict[str, List[Dict[str, Any]]]) -> List[str]:
@@ -248,7 +300,8 @@ class ReportGenerator:
         ]
 
         for disease, trials in sorted(results_by_disease.items()):
-            lines.append(f"### {disease}")
+            sanitized_disease = self._sanitize_text(disease)
+            lines.append(f"### {sanitized_disease}")
             lines.append("")
             lines.append(f"**Total Trials:** {len(trials)}")
             lines.append("")
@@ -275,14 +328,14 @@ class ReportGenerator:
                 if fig_status:
                     lines.append(f"**Status Distribution:**")
                     lines.append("")
-                    lines.append(f"![{disease} Status](figures/{fig_status})")
+                    lines.append(f"![{sanitized_disease} Status](figures/{fig_status})")
                     lines.append("")
 
                 fig_phase = self._create_disease_phase_chart(disease, trials)
                 if fig_phase:
                     lines.append(f"**Phase Distribution:**")
                     lines.append("")
-                    lines.append(f"![{disease} Phases](figures/{fig_phase})")
+                    lines.append(f"![{sanitized_disease} Phases](figures/{fig_phase})")
                     lines.append("")
 
                 top_trials = sorted(trials, key=lambda x: x.get('enrollment', {}).get('count', 0), reverse=True)[:5]
@@ -293,7 +346,7 @@ class ReportGenerator:
                         enrollment = trial.get('enrollment', {}).get('count', 0)
                         if enrollment > 0:
                             nct_id = trial.get('nct_id', '')
-                            title = trial.get('brief_title', '')[:80]
+                            title = self._sanitize_text(trial.get('brief_title', ''))[:80]
                             status = trial.get('overall_status', '')
                             lines.append(f"- **[{nct_id}]({trial.get('url', '')})** ({enrollment:,} participants)")
                             lines.append(f"  - Status: {status}")
@@ -361,26 +414,34 @@ class ReportGenerator:
         Returns:
             Path to saved figure
         """
-        diseases = list(results_by_disease.keys())[:15]
-        trial_counts = [len(results_by_disease[d]) for d in diseases]
+        try:
+            diseases = list(results_by_disease.keys())[:15]
+            trial_counts = [len(results_by_disease[d]) for d in diseases]
 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        bars = ax.barh(diseases, trial_counts, color='steelblue')
+            if not diseases:
+                return None
 
-        ax.set_xlabel('Number of Trials', fontsize=12)
-        ax.set_title('Clinical Trials per Disease', fontsize=14, fontweight='bold')
-        ax.grid(axis='x', alpha=0.3)
+            fig, ax = plt.subplots(figsize=(12, 6))
+            bars = ax.barh(diseases, trial_counts, color='steelblue')
 
-        for i, (disease, count) in enumerate(zip(diseases, trial_counts)):
-            ax.text(count, i, f' {count}', va='center', fontsize=10)
+            ax.set_xlabel('Number of Trials', fontsize=12)
+            ax.set_title('Clinical Trials per Disease', fontsize=14, fontweight='bold')
+            ax.grid(axis='x', alpha=0.3)
 
-        plt.tight_layout()
+            for i, (disease, count) in enumerate(zip(diseases, trial_counts)):
+                ax.text(count, i, f' {count}', va='center', fontsize=10)
 
-        fig_path = self.figures_dir / "trials_per_disease.png"
-        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
-        plt.close()
+            plt.tight_layout()
 
-        return f"figures/{fig_path.name}"
+            fig_path = self.figures_dir / "trials_per_disease.png"
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            return f"figures/{fig_path.name}"
+        except Exception as e:
+            self.logger.warning(f"Failed to create disease comparison chart: {e}")
+            plt.close('all')
+            return None
 
     def _create_status_distribution_chart(self, results_by_disease: Dict[str, List[Dict[str, Any]]]) -> str:
         """
@@ -392,34 +453,42 @@ class ReportGenerator:
         Returns:
             Path to saved figure
         """
-        all_trials = [trial for trials in results_by_disease.values() for trial in trials]
+        try:
+            all_trials = [trial for trials in results_by_disease.values() for trial in trials]
 
-        status_counts = {}
-        for trial in all_trials:
-            status = trial.get('overall_status', 'Unknown')
-            status_counts[status] = status_counts.get(status, 0) + 1
+            if not all_trials:
+                return None
 
-        statuses = list(status_counts.keys())
-        counts = list(status_counts.values())
+            status_counts = {}
+            for trial in all_trials:
+                status = trial.get('overall_status', 'Unknown')
+                status_counts[status] = status_counts.get(status, 0) + 1
 
-        fig, ax = plt.subplots(figsize=(10, 8))
-        colors = plt.cm.Set3(range(len(statuses)))
-        wedges, texts, autotexts = ax.pie(counts, labels=statuses, autopct='%1.1f%%',
-                                           colors=colors, startangle=90)
+            statuses = list(status_counts.keys())
+            counts = list(status_counts.values())
 
-        for autotext in autotexts:
-            autotext.set_color('black')
-            autotext.set_fontweight('bold')
+            fig, ax = plt.subplots(figsize=(10, 8))
+            colors = plt.cm.Set3(range(len(statuses)))
+            wedges, texts, autotexts = ax.pie(counts, labels=statuses, autopct='%1.1f%%',
+                                               colors=colors, startangle=90)
 
-        ax.set_title('Trial Status Distribution', fontsize=14, fontweight='bold')
+            for autotext in autotexts:
+                autotext.set_color('black')
+                autotext.set_fontweight('bold')
 
-        plt.tight_layout()
+            ax.set_title('Trial Status Distribution', fontsize=14, fontweight='bold')
 
-        fig_path = self.figures_dir / "status_distribution.png"
-        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
-        plt.close()
+            plt.tight_layout()
 
-        return f"figures/{fig_path.name}"
+            fig_path = self.figures_dir / "status_distribution.png"
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            return f"figures/{fig_path.name}"
+        except Exception as e:
+            self.logger.warning(f"Failed to create status distribution chart: {e}")
+            plt.close('all')
+            return None
 
     def _create_duration_distribution_chart(self, results_by_disease: Dict[str, List[Dict[str, Any]]]) -> str:
         """
@@ -442,25 +511,39 @@ class ReportGenerator:
         if not durations:
             return None
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.hist(durations, bins=20, color='steelblue', edgecolor='black', alpha=0.7)
+        try:
+            fig, ax = plt.subplots(figsize=(10, 6))
 
-        ax.set_xlabel('Duration (months)', fontsize=12)
-        ax.set_ylabel('Number of Trials', fontsize=12)
-        ax.set_title('Distribution of Trial Durations', fontsize=14, fontweight='bold')
-        ax.grid(axis='y', alpha=0.3)
+            n_bins = min(20, max(5, len(durations) // 10))
 
-        ax.axvline(np.mean(durations), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(durations):.1f} months')
-        ax.axvline(np.median(durations), color='green', linestyle='--', linewidth=2, label=f'Median: {np.median(durations):.1f} months')
-        ax.legend()
+            durations_array = np.array(durations)
+            if len(np.unique(durations_array)) < 3:
+                n_bins = len(np.unique(durations_array))
 
-        plt.tight_layout()
+            ax.hist(durations_array, bins=n_bins, color='steelblue', edgecolor='black', alpha=0.7)
 
-        fig_path = self.figures_dir / "duration_distribution.png"
-        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
-        plt.close()
+            ax.set_xlabel('Duration (months)', fontsize=12)
+            ax.set_ylabel('Number of Trials', fontsize=12)
+            ax.set_title('Distribution of Trial Durations', fontsize=14, fontweight='bold')
+            ax.grid(axis='y', alpha=0.3)
 
-        return f"figures/{fig_path.name}"
+            mean_val = np.mean(durations_array)
+            median_val = np.median(durations_array)
+            ax.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_val:.1f} months')
+            ax.axvline(median_val, color='green', linestyle='--', linewidth=2, label=f'Median: {median_val:.1f} months')
+            ax.legend()
+
+            plt.tight_layout()
+
+            fig_path = self.figures_dir / "duration_distribution.png"
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            return f"figures/{fig_path.name}"
+        except Exception as e:
+            self.logger.warning(f"Failed to create duration distribution chart: {e}")
+            plt.close('all')
+            return None
 
     def _create_phase_distribution_chart(self, results_by_disease: Dict[str, List[Dict[str, Any]]]) -> str:
         """
@@ -472,40 +555,45 @@ class ReportGenerator:
         Returns:
             Path to saved figure or None if no phase data
         """
-        all_trials = [trial for trials in results_by_disease.values() for trial in trials]
+        try:
+            all_trials = [trial for trials in results_by_disease.values() for trial in trials]
 
-        phase_counts = {}
-        for trial in all_trials:
-            phases = trial.get('phases', [])
-            for phase in phases:
-                phase_counts[phase] = phase_counts.get(phase, 0) + 1
+            phase_counts = {}
+            for trial in all_trials:
+                phases = trial.get('phases', [])
+                for phase in phases:
+                    phase_counts[phase] = phase_counts.get(phase, 0) + 1
 
-        if not phase_counts:
+            if not phase_counts:
+                return None
+
+            phases = list(phase_counts.keys())
+            counts = list(phase_counts.values())
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            bars = ax.bar(phases, counts, color='steelblue', edgecolor='black', alpha=0.7)
+
+            ax.set_ylabel('Number of Trials', fontsize=12)
+            ax.set_xlabel('Phase', fontsize=12)
+            ax.set_title('Distribution by Trial Phase', fontsize=14, fontweight='bold')
+            ax.grid(axis='y', alpha=0.3)
+
+            for bar, count in zip(bars, counts):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{int(count)}', ha='center', va='bottom', fontsize=10)
+
+            plt.tight_layout()
+
+            fig_path = self.figures_dir / "phase_distribution.png"
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            return f"figures/{fig_path.name}"
+        except Exception as e:
+            self.logger.warning(f"Failed to create phase distribution chart: {e}")
+            plt.close('all')
             return None
-
-        phases = list(phase_counts.keys())
-        counts = list(phase_counts.values())
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-        bars = ax.bar(phases, counts, color='steelblue', edgecolor='black', alpha=0.7)
-
-        ax.set_ylabel('Number of Trials', fontsize=12)
-        ax.set_xlabel('Phase', fontsize=12)
-        ax.set_title('Distribution by Trial Phase', fontsize=14, fontweight='bold')
-        ax.grid(axis='y', alpha=0.3)
-
-        for bar, count in zip(bars, counts):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{int(count)}', ha='center', va='bottom', fontsize=10)
-
-        plt.tight_layout()
-
-        fig_path = self.figures_dir / "phase_distribution.png"
-        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        return f"figures/{fig_path.name}"
 
     def _generate_conclusions(self, results_by_disease: Dict[str, List[Dict[str, Any]]]) -> List[str]:
         """
@@ -536,7 +624,8 @@ class ReportGenerator:
             lines.append("")
 
             disease_with_most_trials = max(results_by_disease.items(), key=lambda x: len(x[1]))
-            lines.append(f"3. **Most Studied Disease:** {disease_with_most_trials[0]} "
+            sanitized_top_disease = self._sanitize_text(disease_with_most_trials[0])
+            lines.append(f"3. **Most Studied Disease:** {sanitized_top_disease} "
                         f"({len(disease_with_most_trials[1])} trials)")
             lines.append("")
 
@@ -573,7 +662,8 @@ class ReportGenerator:
         bars = ax.bar(statuses, counts, color='steelblue', edgecolor='black', alpha=0.7)
 
         ax.set_ylabel('Number of Trials', fontsize=12)
-        ax.set_title(f'{disease} - Trial Status Distribution', fontsize=14, fontweight='bold')
+        sanitized_disease = self._sanitize_text(disease)
+        ax.set_title(f'{sanitized_disease} - Trial Status Distribution', fontsize=14, fontweight='bold')
         ax.grid(axis='y', alpha=0.3)
         plt.xticks(rotation=45, ha='right')
 
@@ -618,7 +708,8 @@ class ReportGenerator:
         bars = ax.bar(phases, counts, color='coral', edgecolor='black', alpha=0.7)
 
         ax.set_ylabel('Number of Trials', fontsize=12)
-        ax.set_title(f'{disease} - Phase Distribution', fontsize=14, fontweight='bold')
+        sanitized_disease = self._sanitize_text(disease)
+        ax.set_title(f'{sanitized_disease} - Phase Distribution', fontsize=14, fontweight='bold')
         ax.grid(axis='y', alpha=0.3)
         plt.xticks(rotation=45, ha='right')
 
@@ -635,3 +726,42 @@ class ReportGenerator:
         plt.close()
 
         return fig_path.name
+
+    def _generate_disease_mapping_appendix(self, disease_mapping: List[Dict[str, Any]],
+                                          optimized_diseases: List[str]) -> List[str]:
+        """
+        Generate appendix with table mapping original disease terms to optimized terms.
+
+        Args:
+            disease_mapping: List of dicts with 'original' and 'optimized' keys
+            optimized_diseases: List of optimized search terms used for queries
+
+        Returns:
+            List of markdown lines
+        """
+        lines = [
+            "",
+            "\\newpage",
+            "",
+            "---",
+            "",
+            "# Appendix: Disease Term Mapping",
+            "",
+            "The following table shows the mapping from original spreadsheet terms to optimized ClinicalTrials.gov search terms:",
+            "",
+            "| # | Original Term | Optimized Search Term |",
+            "|---|--------------|----------------------|"
+        ]
+
+        for idx, mapping in enumerate(disease_mapping, 1):
+            original = self._sanitize_text(mapping.get('original', ''))
+            optimized = self._sanitize_text(mapping.get('optimized', ''))
+            lines.append(f"| {idx} | {original} | {optimized} |")
+
+        lines.append("")
+        lines.append(f"**Total original terms:** {len(disease_mapping)}")
+        if optimized_diseases:
+            lines.append(f"**Unique optimized terms used for search:** {len(optimized_diseases)}")
+        lines.append("")
+
+        return lines

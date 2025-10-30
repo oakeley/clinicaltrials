@@ -200,14 +200,18 @@ class ClinicalTrialsAPI:
 
         return results
 
-    def query_by_disease(self, disease: str, max_studies: int = None) -> Dict[str, Any]:
+    def query_by_disease(self, disease: str, max_studies: int = None,
+                        apply_filters: bool = True, years_back: int = 10) -> Dict[str, Any]:
         """
         Query clinical trials for a specific disease with detailed information.
         Returns most recent trials first (sorted by LastUpdatePostDate descending).
+        Uses pagination to retrieve up to max_studies results.
 
         Args:
             disease: Disease name or condition
             max_studies: Maximum number of studies to retrieve
+            apply_filters: Whether to apply interventional/industry/date filters
+            years_back: How many years back to search for completion date
 
         Returns:
             Dictionary containing studies list and raw API response
@@ -215,39 +219,120 @@ class ClinicalTrialsAPI:
         if max_studies is None:
             max_studies = self.max_studies
 
-        self.logger.info(f"Querying clinical trials for disease: {disease} (max: {max_studies}, sorted by most recent)")
+        filter_desc = ""
+        if apply_filters:
+            filter_desc = f" (interventional, pharma industry, last {years_back} years)"
+
+        self.logger.info(f"Querying clinical trials for disease: {disease} (max: {max_studies}, sorted by most recent{filter_desc})")
 
         endpoint = f"{self.base_url}/studies"
 
-        params = {
-            "query.cond": disease,
-            "pageSize": max_studies,
+        query_parts = [f'"{disease}"']
+        if apply_filters:
+            query_parts.append("AND AREA[StudyType]Interventional")
+            query_parts.append("AND AREA[LeadSponsorClass]Industry")
+
+        query_term = " ".join(query_parts)
+
+        # API limit is 1000 per page
+        page_size = min(1000, max_studies)
+
+        base_params = {
+            "query.term": query_term,
+            "pageSize": page_size,
             "sort": "LastUpdatePostDate:desc",
-            "fields": "NCTId,BriefTitle,OfficialTitle,OverallStatus,StartDate,StartDateType,"
-                     "PrimaryCompletionDate,PrimaryCompletionDateType,CompletionDate,CompletionDateType,"
-                     "StudyFirstPostDate,LastUpdatePostDate,Condition,InterventionType,InterventionName,"
-                     "BriefSummary,DetailedDescription,PrimaryOutcomeMeasure,PrimaryOutcomeDescription,"
-                     "PrimaryOutcomeTimeFrame,SecondaryOutcomeMeasure,SecondaryOutcomeDescription,"
-                     "SecondaryOutcomeTimeFrame,Phase,EnrollmentCount,EnrollmentType,StudyType,"
-                     "LeadSponsorName,CollaboratorName,ResultsFirstPostDate,HasResults"
+            "format": "json"
         }
 
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status()
+        if apply_filters:
+            from datetime import datetime, timedelta
+            cutoff_date = datetime.now() - timedelta(days=years_back * 365)
+            cutoff_str = cutoff_date.strftime("%Y-%m-%d")
 
-        raw_data = response.json()
-        studies = raw_data.get('studies', [])
+            self.logger.info(f"Query: {query_term}")
+            self.logger.info(f"Post-retrieval filter: completion date >= {cutoff_str}")
 
-        self.logger.info(f"Retrieved {len(studies)} studies for disease: {disease} (sorted by most recent)")
+        # Pagination loop to retrieve up to max_studies
+        all_studies = []
+        page_token = None
+        page_count = 0
 
-        time.sleep(self.rate_limit_delay)
+        while len(all_studies) < max_studies:
+            page_count += 1
+            params = base_params.copy()
+            if page_token:
+                params['pageToken'] = page_token
+
+            try:
+                response = requests.get(endpoint, params=params, timeout=30)
+                response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"API request failed for disease '{disease}' on page {page_count}: {e}")
+                if page_count == 1:
+                    return {
+                        'disease': disease,
+                        'studies': [],
+                        'raw_api_response': {},
+                        'query_params': base_params,
+                        'total_count': 0,
+                        'error': str(e)
+                    }
+                else:
+                    break
+
+            raw_data = response.json()
+            studies = raw_data.get('studies', [])
+
+            if not studies:
+                break
+
+            all_studies.extend(studies)
+            self.logger.info(f"  Page {page_count}: fetched {len(studies)} studies (total: {len(all_studies)})")
+
+            page_token = raw_data.get('nextPageToken')
+            if not page_token:
+                break
+
+            time.sleep(self.rate_limit_delay)
+
+        # Truncate to max_studies if we got more
+        if len(all_studies) > max_studies:
+            all_studies = all_studies[:max_studies]
+            self.logger.info(f"Truncated to {max_studies} studies")
+
+        if apply_filters and years_back:
+            from datetime import datetime, timedelta
+            cutoff_date = datetime.now() - timedelta(days=years_back * 365)
+            original_count = len(all_studies)
+
+            filtered_studies = []
+            for study in all_studies:
+                protocol_section = study.get('protocolSection', {})
+                status_module = protocol_section.get('statusModule', {})
+                completion_date_struct = status_module.get('completionDateStruct', {})
+                completion_date_str = completion_date_struct.get('date', '')
+
+                if completion_date_str:
+                    try:
+                        completion_date = self._parse_date(completion_date_str)
+                        if completion_date < cutoff_date:
+                            continue
+                    except ValueError:
+                        pass
+
+                filtered_studies.append(study)
+
+            all_studies = filtered_studies
+            self.logger.info(f"Client-side date filtering (>={years_back}y): {original_count} -> {len(all_studies)} studies")
+
+        self.logger.info(f"Retrieved {len(all_studies)} studies for disease: {disease} (sorted by most recent{filter_desc})")
 
         return {
             'disease': disease,
-            'studies': studies,
+            'studies': all_studies,
             'raw_api_response': raw_data,
-            'query_params': params,
-            'total_count': len(studies)
+            'query_params': base_params,
+            'total_count': len(all_studies)
         }
 
     def extract_detailed_study_info(self, study: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,8 +378,10 @@ class ClinicalTrialsAPI:
 
         sponsor_module = protocol_section.get('sponsorCollaboratorsModule', {})
         lead_sponsor = sponsor_module.get('leadSponsor', {})
+        lead_sponsor_name = lead_sponsor.get('name', '')
+        lead_sponsor_class = lead_sponsor.get('class', '')
 
-        has_results = derived_section.get('miscInfoModule', {}).get('hasResults', False)
+        has_results = bool(results_section and len(results_section) > 0)
 
         start_date_str = start_date.get('date', '') if start_date else ''
         completion_date_str = completion_date.get('date', '') if completion_date else ''
@@ -347,7 +434,10 @@ class ClinicalTrialsAPI:
                 'brief_summary': brief_summary,
                 'detailed_description': detailed_description
             },
-            'sponsor': lead_sponsor.get('name', ''),
+            'sponsor': {
+                'name': lead_sponsor_name,
+                'class': lead_sponsor_class
+            },
             'url': f"https://clinicaltrials.gov/study/{nct_id}"
         }
 
@@ -386,14 +476,22 @@ class ClinicalTrialsAPI:
             if completion_date:
                 end_dt = self._parse_date(completion_date)
                 duration_info['status'] = 'actual' if is_complete else 'expected'
-            else:
-                end_dt = datetime.now()
-                duration_info['status'] = 'ongoing'
 
-            delta = end_dt - start_dt
-            duration_info['days'] = delta.days
-            duration_info['months'] = round(delta.days / 30.44)
-            duration_info['years'] = round(delta.days / 365.25, 1)
+                delta = end_dt - start_dt
+                duration_info['days'] = delta.days
+                duration_info['months'] = round(delta.days / 30.44)
+                duration_info['years'] = round(delta.days / 365.25, 1)
+            else:
+                if is_complete:
+                    duration_info['status'] = 'completed_no_date'
+                else:
+                    end_dt = datetime.now()
+                    duration_info['status'] = 'ongoing'
+
+                    delta = end_dt - start_dt
+                    duration_info['days'] = delta.days
+                    duration_info['months'] = round(delta.days / 30.44)
+                    duration_info['years'] = round(delta.days / 365.25, 1)
 
         except ValueError:
             self.logger.warning(f"Could not parse dates: {start_date}, {completion_date}")
